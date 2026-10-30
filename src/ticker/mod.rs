@@ -3,4 +3,4 @@
 
 mod core;
 mod macros;
-pub use core::{ClientHandle, Ticker, TickerBuilder};
+pub use core::{ClientHandle, LatestPrice, Ticker, TickerBuilder};

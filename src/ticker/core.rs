@@ -67,6 +67,77 @@ type MapCache<K, V> = Arc<RwLock<HashMap<K, CacheEntry<V>>>>;
 /// ```
 #[derive(Clone)]
 pub struct ClientHandle(pub(crate) Arc<YahooClient>);
+
+/// The provider's latest available trade, including overnight trading.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct LatestPrice {
+    pub symbol: String,
+    pub price: f64,
+    pub currency: Option<String>,
+    /// Provider trade time, when supplied. A price does not require this field.
+    pub timestamp: Option<i64>,
+}
+
+impl LatestPrice {
+    fn from_quote(row: &serde_json::Value) -> Option<Self> {
+        let candidates = [
+            ("regularMarketPrice", "regularMarketTime"),
+            ("preMarketPrice", "preMarketTime"),
+            ("postMarketPrice", "postMarketTime"),
+            ("overnightMarketPrice", "overnightMarketTime"),
+        ];
+        let active = match row["marketState"].as_str() {
+            Some("REGULAR") => Some(0),
+            Some("PRE") => Some(1),
+            Some("POST") => Some(2),
+            Some("OVERNIGHT" | "PREPRE" | "POSTPOST") => Some(3),
+            _ => None,
+        };
+        let available = candidates
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (price, at))| {
+                let price = row[*price]
+                    .as_f64()
+                    .or_else(|| row[*price].as_str()?.parse().ok())?;
+                (price.is_finite() && price > 0.0).then_some((index, price, row[*at].as_i64()))
+            })
+            .collect::<Vec<_>>();
+        let (_, price, timestamp) = available
+            .iter()
+            .find(|(index, _, _)| Some(*index) == active)
+            .or_else(|| available.iter().max_by_key(|(_, _, at)| *at))?;
+        Some(Self {
+            symbol: row["symbol"].as_str()?.to_owned(),
+            price: *price,
+            currency: row["currency"].as_str().map(str::to_owned),
+            timestamp: *timestamp,
+        })
+    }
+}
+
+impl ClientHandle {
+    /// Fetch the latest available prices for all requested symbols in one call.
+    ///
+    /// Uses shared authenticated batch requests with overnight pricing enabled.
+    /// Selects the active regular/pre/post/overnight price, otherwise the newest
+    /// available timestamped trade. A trade timestamp is not required.
+    pub async fn last_prices(&self, symbols: &[&str]) -> Result<Vec<LatestPrice>> {
+        let response = crate::adapters::yahoo::quote::quotes::fetch_with_fields(
+            &self.0, symbols, None, false, false,
+        )
+        .await?;
+        if !response["quoteResponse"]["error"].is_null() {
+            return Err(crate::FinanceError::ApiError(
+                response["quoteResponse"]["error"].to_string(),
+            ));
+        }
+        let rows = response["quoteResponse"]["result"]
+            .as_array()
+            .ok_or_else(|| crate::FinanceError::ApiError("batch quote result missing".into()))?;
+        Ok(rows.iter().filter_map(LatestPrice::from_quote).collect())
+    }
+}
 /// Builder for constructing a [`Ticker`] with optional configuration.
 ///
 /// Construct via [`Ticker::builder`]. All builder methods are optional;
@@ -1229,6 +1300,36 @@ super::macros::define_quote_accessors! {
 mod tests {
     use super::*;
     use crate::providers::mock::{CountingProvider, provider_set};
+
+    #[test]
+    fn latest_trade_covers_all_sessions_without_requiring_timestamps() {
+        for (state, expected) in [
+            ("REGULAR", 100.0),
+            ("PRE", 101.0),
+            ("POST", 102.0),
+            ("OVERNIGHT", 103.0),
+            ("PREPRE", 103.0),
+            ("POSTPOST", 103.0),
+        ] {
+            let value = serde_json::json!({"symbol":"AAPL","currency":"USD","marketState":state,
+                "regularMarketPrice":100,"preMarketPrice":101,"postMarketPrice":102,"overnightMarketPrice":103,
+                "regularMarketPreviousClose":90,"bid":98,"ask":105});
+            let trade = LatestPrice::from_quote(&value).unwrap();
+            assert_eq!(trade.price, expected, "{state}");
+            assert_eq!(trade.timestamp, None);
+        }
+    }
+
+    #[test]
+    fn closed_market_retains_the_newest_known_trade_instead_of_regular_close() {
+        let value = serde_json::json!({"symbol":"GME","marketState":"CLOSED",
+            "regularMarketPrice":27.15,"regularMarketTime":1000,
+            "postMarketPrice":27.10,"postMarketTime":2000,
+            "overnightMarketPrice":26.76,"overnightMarketTime":3000});
+        let trade = LatestPrice::from_quote(&value).unwrap();
+        assert_eq!(trade.price, 26.76);
+        assert_eq!(trade.timestamp, Some(3000));
+    }
 
     #[tokio::test]
     async fn default_caches_quote_across_accessors() {
